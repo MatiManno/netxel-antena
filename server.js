@@ -1,95 +1,115 @@
 const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
+const http = require('http').createServer(app);
+const io = require('socket.io')(http, {
+    cors: { origin: "*" }
 });
+
+const PORT = process.env.PORT || 3000;
+
+// Aquí guardamos quién es quién y su estado
+// Estructura: { "141*101": { socketId: "...", estado: "Disponible", hablandoCon: null } }
+const usuariosConectados = {};
 
 app.use(express.static('public'));
 
-let usuariosConectados = {}; 
-let contadorUsuarios = 0;
-
-// Objeto para controlar el estado de las conversaciones en tiempo real
-// Estructura: { "id_emisor-id_receptor": timeoutID }
-let sesionesCanalAbierto = {};
-
 io.on('connection', (socket) => {
-    console.log(`🔌 Conexión a la antena: ${socket.id}`);
+    console.log('Nueva conexión detectada:', socket.id);
 
-    socket.on('unirse_flota', (data) => {
-        contadorUsuarios++;
-        const idNextelGenerado = `${data.flota}*${contadorUsuarios}`;
+    // 1. Registro del ID Fijo del teléfono
+    socket.on('registrar_usuario', (idNextel) => {
+        socket.idNextel = idNextel;
+        usuariosConectados[idNextel] = {
+            socketId: socket.id,
+            estado: 'Disponible',
+            hablandoCon: null
+        };
+        console.log(`Usuario ${idNextel} registrado y Disponible.`);
+    });
+
+    // 2. Intentar abrir canal (Pulsar PTT)
+    socket.on('intentar_llamar', (idDestino) => {
+        const emisor = socket.idNextel;
+        const receptor = idDestino;
+
+        // Verificar si el receptor existe en internet
+        if (!usuariosConectados[receptor]) {
+            socket.emit('usuario_no_disponible', { motivo: 'No conectado' });
+            return;
+        }
+
+        const datosReceptor = usuariosConectados[receptor];
+
+        // Verificar si el receptor está ocupado hablando con otro
+        if (datosReceptor.estado === 'Ocupado' && datosReceptor.hablandoCon !== emisor) {
+            socket.emit('error_servidor', { mensaje: 'Ocupado' });
+            return;
+        }
+
+        // Si está disponible, se enlaza el canal para ambos
+        usuariosConectados[emisor].estado = 'Ocupado';
+        usuariosConectados[emisor].hablandoCon = receptor;
         
-        socket.idNextel = idNextelGenerado;
-        socket.flotaNextel = data.flota;
-        socket.nombreNextel = data.nombre;
-        usuariosConectados[idNextelGenerado] = socket.id;
+        usuariosConectados[receptor].estado = 'Ocupado';
+        usuariosConectados[receptor].hablandoCon = emisor;
 
-        console.log(`📟 Radio Activa: ${data.nombre} -> ID ${idNextelGenerado}`);
-        socket.emit('conexion_exitosa', { idNextel: idNextelGenerado, mensaje: "NetXel Activa" });
+        // Avisarle al receptor quién lo está llamando
+        io.to(datosReceptor.socketId).emit('canal_abierto', { por: emisor });
+        socket.emit('canal_listo_para_transmitir');
     });
 
-    socket.on('enviar_alerta', (data) => {
-        const receptorSocketId = usuariosConectados[data.destino];
-        if (receptorSocketId) {
-            io.to(receptorSocketId).emit('recibir_alerta', {
-                desde: socket.idNextel,
-                nombre: socket.nombreNextel
-            });
-        } else {
-            socket.emit('error_conexion', { mensaje: "ID fuera de área." });
-        }
-    });
-
-    // 🎙️ EN TIEMPO REAL: RECIBIR TROZOS DE AUDIO EN VIVO Y TRANSMITIRLOS AL INSTANTE
-    socket.on('stream_audio_vivo', (data) => {
-        const receptorSocketId = usuariosConectados[data.destino];
-        if (!receptorSocketId) return;
-
-        // Generamos una clave única para identificar la sesión entre estos dos handies
-        const parRadios = [socket.idNextel, data.destino].sort().join('-');
-
-        let debeSonarChirp = false;
-
-        // Si NO existe una sesión activa para este par, significa que el canal estaba CERRADO
-        if (!sesionesCanalAbierto[parRadios]) {
-            debeSonarChirp = true; // Hay que avisarle al receptor que haga sonar el bip-bip de apertura
-            console.log(`📡 [Abriendo Canal] Conversación nueva entre ${socket.idNextel} y ${data.destino}`);
-        } else {
-            // Si ya existía, cancelamos el temporizador de cierre viejo porque siguen hablando
-            clearTimeout(sesionesCanalAbierto[parRadios]);
-        }
-
-        // Seteamos (o renovamos) el temporizador a 12 SEGUNDOS CLAVADOS de canal abierto
-        sesionesCanalAbierto[parRadios] = setTimeout(() => {
-            console.log(`⏳ [Canal Cerrado] Se cumplieron los 12 segundos de inactividad entre ${socket.idNextel} y ${data.destino}`);
-            delete sesionesCanalAbierto[parRadios];
+    // 3. Transmisión de Audio en tiempo real (Privada)
+    socket.on('audio_stream', (data) => {
+        const emisor = socket.idNextel;
+        if (usuariosConectados[emisor] && usuariosConectados[emisor].hablandoCon) {
+            const destino = usuariosConectados[emisor].hablandoCon;
+            const socketDestino = usuariosConectados[destino]?.socketId;
             
-            // Le avisamos a ambas radios que el canal se cayó por inactividad para que vuelvan a READY
-            io.to(socket.id).emit('canal_cerrado_inactividad');
-            io.to(receptorSocketId).emit('canal_cerrado_inactividad');
-        }, 12000);
-
-        // Le retransmitimos el pedacito de voz en vivo al receptor al milisegundo
-        io.to(receptorSocketId).emit('recibir_audio_vivo', {
-            chunk: data.chunk, // El fragmento diminuto de voz
-            desde: socket.idNextel,
-            nombre: socket.nombreNextel,
-            abrirCanal: debeSonarChirp // Le indica si tiene que ejecutar el sonido inicial
-        });
+            if (socketDestino) {
+                // Le manda el audio únicamente al receptor vinculado
+                io.to(socketDestino).emit('audio_receive', data);
+            }
+        }
     });
 
+    // 4. Soltar PTT (Cerrar canal)
+    socket.on('soltar_ptt', () => {
+        const emisor = socket.idNextel;
+        if (usuariosConectados[emisor]) {
+            const destino = usuariosConectados[emisor].hablandoCon;
+
+            // Liberar al emisor
+            usuariosConectados[emisor].estado = 'Disponible';
+            usuariosConectados[emisor].hablandoCon = null;
+
+            // Liberar al receptor si seguía conectado
+            if (destino && usuariosConectados[destino]) {
+                usuariosConectados[destino].estado = 'Disponible';
+                usuariosConectados[destino].hablandoCon = null;
+                io.to(usuariosConectados[destino].socketId).emit('canal_cerrado');
+            }
+        }
+    });
+
+    // 5. Desconexión repentina (Se cerró la app o se quedó sin señal)
     socket.on('disconnect', () => {
-        if (socket.idNextel) {
-            console.log(`🛑 Radio Apagada: ${socket.idNextel}`);
-            delete usuariosConectados[socket.idNextel];
+        const idNextel = socket.idNextel;
+        if (idNextel && usuariosConectados[idNextel]) {
+            const destino = usuariosConectados[idNextel].hablandoCon;
+            
+            // Si estaba hablando con alguien, liberamos a la otra persona primero
+            if (destino && usuariosConectados[destino]) {
+                usuariosConectados[destino].estado = 'Disponible';
+                usuariosConectados[destino].hablandoCon = null;
+                io.to(usuariosConectados[destino].socketId).emit('canal_cerrado');
+            }
+
+            delete usuariosConectados[idNextel];
+            console.log(`Usuario ${idNextel} se ha desconectado.`);
         }
     });
 });
 
-const PORT = 3000;
-server.listen(PORT, () => console.log(`🚀 Antena en puerto ${PORT}`));
+http.listen(PORT, () => {
+    console.log(`Antena NetXel operando en puerto ${PORT}`);
+});
